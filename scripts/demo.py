@@ -94,7 +94,7 @@ def step(title: str):
 
 # ---- Helpers ---------------------------------------------------------------
 
-DOCKER_CONTAINER = "lending-python-postgres-1"
+DOCKER_CONTAINER = "lending-postgres-1"
 DB_USER = "lending"
 DB_NAME = "lending_db"
 
