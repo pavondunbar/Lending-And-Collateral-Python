@@ -682,19 +682,31 @@ docker compose logs -f lending-engine         # Single service
 docker compose logs -f liquidation-engine     # Liquidation events
 ```
 
+**Kafka debugging:**
+
+```bash
+make topics                                   # List all topics
+make kafka-tail                               # Tail loan.originated (default)
+make kafka-tail TOPIC=margin.call.triggered   # Tail a specific topic
+```
+
 **Inspect database:**
 
 ```bash
 make db-loans            # Recent loans
 make db-collateral       # Collateral positions
 make db-journal          # Journal entries
+make db-balances         # Per-account balances (derived from journal)
+make db-ledger           # Trial balance by COA code
 make shell-pg            # Interactive psql shell
 ```
 
 **Run test suite:**
 
 ```bash
-make test
+make test                                     # Full suite
+make test-unit                                # Unit tests only (excludes e2e)
+make test-e2e                                 # End-to-end scenarios only
 ```
 
 **Tear down:**
@@ -759,13 +771,18 @@ uvicorn services.lending-engine.main:app --host 0.0.0.0 --port 8001
 | `make health` | Check gateway health endpoint |
 | `make demo` | Run live-stack demonstration |
 | `make test` | Full pytest suite |
+| `make test-unit` | Unit tests (excludes e2e) |
+| `make test-e2e` | End-to-end scenario tests |
 | `make integrity` | Ledger double-entry integrity check |
+| `make kafka-tail` | Tail a Kafka topic (`TOPIC=loan.originated`) |
 | `make topics` | List Kafka topics |
 | `make shell-pg` | Interactive psql shell |
 | `make shell-kafka` | Interactive Kafka bash shell |
 | `make db-loans` | Show recent loans |
 | `make db-collateral` | Show collateral positions |
 | `make db-journal` | Show recent journal entries |
+| `make db-balances` | Account balances derived from journal |
+| `make db-ledger` | Trial balance by COA code |
 | `make open-docs` | Open Swagger UI in browser |
 
 ---
