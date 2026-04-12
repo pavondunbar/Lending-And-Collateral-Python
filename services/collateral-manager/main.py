@@ -48,9 +48,13 @@ from shared.idempotency import (
     get_idempotency_key, check_idempotency,
     store_idempotency_result,
 )
+from shared.blockchain import mine_transaction
+from shared.settlement import create_settlement, transition_settlement
+from shared.request_context import get_actor_id, get_trace_id
 from events import (
     CollateralDeposited, CollateralWithdrawn,
     CollateralSubstituted, CollateralValuationComputed,
+    SettlementConfirmed,
 )
 
 # ────────────────────────────────────────────────────────────────────
@@ -75,6 +79,76 @@ SYSTEM_CUSTODY_ACCOUNT_ID = os.environ.get(
 
 def normalize(amount: Decimal) -> Decimal:
     return amount.quantize(PRECISION, rounding=ROUND_HALF_EVEN)
+
+
+def _settle_on_chain(
+    db: Session,
+    operation: str,
+    entity_type: str,
+    entity_id,
+    asset_type: str,
+    quantity: Decimal,
+    *receipt_seeds: str,
+) -> dict:
+    """Create a settlement with full blockchain lifecycle."""
+    receipt = mine_transaction(operation, *receipt_seeds)
+    actor = get_actor_id() or SERVICE
+    trace = get_trace_id()
+
+    settlement = create_settlement(
+        db,
+        related_entity_type=entity_type,
+        related_entity_id=entity_id,
+        operation=operation,
+        asset_type=asset_type,
+        quantity=quantity,
+        actor_id=actor,
+        trace_id=trace,
+    )
+
+    transition_settlement(
+        db, settlement, "approved",
+        actor_id=actor, trace_id=trace,
+        approved_by=actor,
+    )
+    transition_settlement(
+        db, settlement, "signed",
+        actor_id=actor, trace_id=trace,
+        tx_hash=receipt.tx_hash,
+    )
+    transition_settlement(
+        db, settlement, "broadcasted",
+        actor_id=actor, trace_id=trace,
+        tx_hash=receipt.tx_hash,
+        block_number=receipt.block_number,
+    )
+    transition_settlement(
+        db, settlement, "confirmed",
+        actor_id=actor, trace_id=trace,
+        confirmations=receipt.confirmations,
+    )
+
+    insert_outbox_event(
+        db,
+        settlement.settlement_ref,
+        "settlement.confirmed",
+        SettlementConfirmed(
+            service=SERVICE,
+            settlement_ref=settlement.settlement_ref,
+            tx_hash=receipt.tx_hash,
+            block_number=receipt.block_number,
+            confirmations=receipt.confirmations,
+        ),
+    )
+
+    return {
+        "tx_hash": receipt.tx_hash,
+        "block_number": receipt.block_number,
+        "block_hash": receipt.block_hash,
+        "gas_used": receipt.gas_used,
+        "confirmations": receipt.confirmations,
+        "settlement_ref": settlement.settlement_ref,
+    }
 
 
 def _get_latest_prices(db: Session) -> dict[str, Decimal]:
@@ -292,11 +366,23 @@ def _deposit_collateral(
         ),
     )
 
-    log.info(
-        "Collateral deposited: %s asset=%s qty=%s",
-        collateral_ref, req.asset_type, req.quantity,
+    chain = _settle_on_chain(
+        db,
+        "collateral_deposit",
+        "collateral",
+        position.id,
+        req.asset_type,
+        req.quantity,
+        collateral_ref,
+        str(req.quantity),
     )
-    return position
+
+    log.info(
+        "Collateral deposited: %s asset=%s qty=%s tx=%s block=%d",
+        collateral_ref, req.asset_type, req.quantity,
+        chain["tx_hash"], chain["block_number"],
+    )
+    return position, chain
 
 
 def _withdraw_collateral(
@@ -453,24 +539,23 @@ def _withdraw_collateral(
         ),
     )
 
-    from shared.settlement import create_settlement
-    from shared.request_context import get_actor_id, get_trace_id
-    settlement = create_settlement(
+    chain = _settle_on_chain(
         db,
-        related_entity_type="collateral",
-        related_entity_id=position.id,
-        operation="collateral_withdrawal",
-        asset_type=position.asset_type,
-        quantity=req.quantity,
-        actor_id=get_actor_id(),
-        trace_id=get_trace_id(),
+        "collateral_withdrawal",
+        "collateral",
+        position.id,
+        position.asset_type,
+        req.quantity,
+        req.collateral_ref,
+        str(req.quantity),
     )
 
     log.info(
-        "Collateral withdrawn: %s qty=%s",
+        "Collateral withdrawn: %s qty=%s tx=%s block=%d",
         req.collateral_ref, req.quantity,
+        chain["tx_hash"], chain["block_number"],
     )
-    return position, settlement
+    return position, chain
 
 
 def _substitute_collateral(
@@ -639,11 +724,24 @@ def _substitute_collateral(
         ),
     )
 
-    log.info(
-        "Collateral substituted: %s -> %s for loan %s",
-        req.remove_ref, new_ref, loan.loan_ref,
+    chain = _settle_on_chain(
+        db,
+        "collateral_substitution",
+        "collateral",
+        new_position.id,
+        req.add_asset_type,
+        req.add_quantity,
+        req.remove_ref,
+        new_ref,
+        str(req.add_quantity),
     )
-    return old_position, new_position
+
+    log.info(
+        "Collateral substituted: %s -> %s tx=%s block=%d",
+        req.remove_ref, new_ref,
+        chain["tx_hash"], chain["block_number"],
+    )
+    return old_position, new_position, chain
 
 
 # ─── FastAPI App ───────────────────────────────────────────────────
@@ -705,27 +803,31 @@ def deposit_collateral(
                 status_code=existing.response_status,
                 content=existing.response_body,
             )
-    position = _deposit_collateral(db, req)
+    position, chain = _deposit_collateral(db, req)
 
     latest_prices = _get_latest_prices(db)
     price = latest_prices.get(position.asset_type, ZERO)
     estimated = _compute_position_value(position, price)
 
     loan = db.get(Loan, position.loan_id)
-    result = CollateralResponse(
-        collateral_ref=position.collateral_ref,
-        loan_ref=loan.loan_ref if loan else "unknown",
-        asset_type=position.asset_type,
-        quantity=position.quantity,
-        haircut_pct=position.haircut_pct,
-        status=position.status,
-        estimated_value_usd=estimated,
-    )
+    result = {
+        "collateral_ref": position.collateral_ref,
+        "loan_ref": loan.loan_ref if loan else "unknown",
+        "asset_type": position.asset_type,
+        "quantity": str(position.quantity),
+        "haircut_pct": str(position.haircut_pct),
+        "status": position.status,
+        "estimated_value_usd": str(estimated),
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
+        "settlement_ref": chain["settlement_ref"],
+    }
     if idem_key:
-        store_idempotency_result(
-            db, idem_key, 201, result.model_dump(mode="json"),
-        )
-    return result
+        store_idempotency_result(db, idem_key, 201, result)
+    return JSONResponse(status_code=201, content=result)
 
 
 @app.post("/collateral/withdraw")
@@ -747,14 +849,19 @@ def withdraw_collateral(
                 status_code=existing.response_status,
                 content=existing.response_body,
             )
-    position, settlement = _withdraw_collateral(db, req)
+    position, chain = _withdraw_collateral(db, req)
     loan = db.get(Loan, position.loan_id)
     result = {
         "collateral_ref": position.collateral_ref,
         "loan_ref": loan.loan_ref if loan else "unknown",
         "status": position.status,
         "remaining_quantity": str(position.quantity),
-        "settlement_ref": settlement.settlement_ref,
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
+        "settlement_ref": chain["settlement_ref"],
     }
     if idem_key:
         store_idempotency_result(db, idem_key, 200, result)
@@ -783,7 +890,7 @@ def substitute_collateral(
                 status_code=existing.response_status,
                 content=existing.response_body,
             )
-    old_pos, new_pos = _substitute_collateral(db, req)
+    old_pos, new_pos, chain = _substitute_collateral(db, req)
     loan = db.get(Loan, new_pos.loan_id)
 
     latest_prices = _get_latest_prices(db)
@@ -804,10 +911,16 @@ def substitute_collateral(
             "status": new_pos.status,
             "estimated_value_usd": str(estimated),
         },
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
+        "settlement_ref": chain["settlement_ref"],
     }
     if idem_key:
         store_idempotency_result(db, idem_key, 201, result)
-    return result
+    return JSONResponse(status_code=201, content=result)
 
 
 @app.get(

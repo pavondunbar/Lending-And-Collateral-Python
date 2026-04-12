@@ -38,6 +38,7 @@ from metrics import instrument_app
 from models import (
     Account, Loan, CollateralPosition,
     PriceFeed, InterestAccrualEvent, JournalEntry,
+    Settlement,
 )
 from shared.journal import (
     record_journal_pair,
@@ -51,10 +52,14 @@ from shared.idempotency import (
     get_idempotency_key, check_idempotency,
     store_idempotency_result,
 )
+from shared.blockchain import mine_transaction
+from shared.settlement import create_settlement, transition_settlement
+from shared.request_context import get_actor_id, get_trace_id
 from events import (
     LoanOriginated, LoanDisbursed,
     LoanRepaymentReceived, LoanRepaymentCompleted,
     LoanClosed, InterestAccrued,
+    SettlementConfirmed,
 )
 
 # ────────────────────────────────────────────────────────────────────
@@ -74,6 +79,80 @@ ZERO = Decimal("0")
 
 def normalize(amount: Decimal) -> Decimal:
     return amount.quantize(PRECISION, rounding=ROUND_HALF_EVEN)
+
+
+def _settle_on_chain(
+    db: Session,
+    operation: str,
+    entity_type: str,
+    entity_id,
+    asset_type: str,
+    quantity: Decimal,
+    *receipt_seeds: str,
+) -> dict:
+    """Create a settlement with full blockchain lifecycle.
+
+    Returns a dict with tx_hash, block_number, settlement_ref,
+    and the full receipt for embedding in API responses.
+    """
+    receipt = mine_transaction(operation, *receipt_seeds)
+    actor = get_actor_id() or SERVICE
+    trace = get_trace_id()
+
+    settlement = create_settlement(
+        db,
+        related_entity_type=entity_type,
+        related_entity_id=entity_id,
+        operation=operation,
+        asset_type=asset_type,
+        quantity=quantity,
+        actor_id=actor,
+        trace_id=trace,
+    )
+
+    transition_settlement(
+        db, settlement, "approved",
+        actor_id=actor, trace_id=trace,
+        approved_by=actor,
+    )
+    transition_settlement(
+        db, settlement, "signed",
+        actor_id=actor, trace_id=trace,
+        tx_hash=receipt.tx_hash,
+    )
+    transition_settlement(
+        db, settlement, "broadcasted",
+        actor_id=actor, trace_id=trace,
+        tx_hash=receipt.tx_hash,
+        block_number=receipt.block_number,
+    )
+    transition_settlement(
+        db, settlement, "confirmed",
+        actor_id=actor, trace_id=trace,
+        confirmations=receipt.confirmations,
+    )
+
+    insert_outbox_event(
+        db,
+        settlement.settlement_ref,
+        "settlement.confirmed",
+        SettlementConfirmed(
+            service=SERVICE,
+            settlement_ref=settlement.settlement_ref,
+            tx_hash=receipt.tx_hash,
+            block_number=receipt.block_number,
+            confirmations=receipt.confirmations,
+        ),
+    )
+
+    return {
+        "tx_hash": receipt.tx_hash,
+        "block_number": receipt.block_number,
+        "block_hash": receipt.block_hash,
+        "gas_used": receipt.gas_used,
+        "confirmations": receipt.confirmations,
+        "settlement_ref": settlement.settlement_ref,
+    }
 
 
 def _get_coa_balance(
@@ -393,8 +472,22 @@ def _originate_loan(
         ),
     )
 
-    log.info("Loan originated: %s principal=%s", loan_ref, principal)
-    return loan
+    chain = _settle_on_chain(
+        db,
+        "loan_origination",
+        "loan",
+        loan.id,
+        req.currency,
+        principal,
+        loan_ref,
+        str(principal),
+    )
+
+    log.info(
+        "Loan originated: %s principal=%s tx=%s block=%d",
+        loan_ref, principal, chain["tx_hash"], chain["block_number"],
+    )
+    return loan, chain
 
 
 def _get_latest_prices(db: Session) -> dict[str, Decimal]:
@@ -597,17 +690,35 @@ def _repay_loan(
             ),
         )
 
+    chain = _settle_on_chain(
+        db,
+        "loan_repayment",
+        "loan",
+        loan.id,
+        currency,
+        amount,
+        loan.loan_ref,
+        str(amount),
+    )
+
     log.info(
-        "Repayment: %s amount=%s interest=%s principal=%s",
-        loan.loan_ref, amount, interest_portion, principal_portion,
+        "Repayment: %s amount=%s tx=%s block=%d",
+        loan.loan_ref, amount,
+        chain["tx_hash"], chain["block_number"],
     )
     return {
         "loan_ref": loan.loan_ref,
-        "amount": amount,
-        "interest_portion": interest_portion,
-        "principal_portion": principal_portion,
+        "amount": str(amount),
+        "interest_portion": str(interest_portion),
+        "principal_portion": str(principal_portion),
         "fully_repaid": fully_repaid,
         "status": loan.status,
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
+        "settlement_ref": chain["settlement_ref"],
     }
 
 
@@ -633,8 +744,21 @@ def _close_loan(db: Session, loan: Loan) -> Loan:
         ),
     )
 
-    log.info("Loan closed: %s", loan.loan_ref)
-    return loan
+    chain = _settle_on_chain(
+        db,
+        "loan_close",
+        "loan",
+        loan.id,
+        loan.currency,
+        Decimal("0"),
+        loan.loan_ref,
+    )
+
+    log.info(
+        "Loan closed: %s tx=%s block=%d",
+        loan.loan_ref, chain["tx_hash"], chain["block_number"],
+    )
+    return loan, chain
 
 
 def _compute_current_ltv(
@@ -786,26 +910,36 @@ def originate_loan(
                 status_code=existing.response_status,
                 content=existing.response_body,
             )
-    loan = _originate_loan(db, req)
+    loan, chain = _originate_loan(db, req)
     current_ltv = _compute_current_ltv(db, loan)
-    result = LoanResponse(
-        loan_id=str(loan.id),
-        loan_ref=loan.loan_ref,
-        borrower_id=str(loan.borrower_id),
-        lender_pool_id=str(loan.lender_pool_id),
-        principal=loan.principal,
-        currency=loan.currency,
-        interest_rate_bps=loan.interest_rate_bps,
-        current_ltv=current_ltv,
-        status=loan.status,
-        disbursed_at=loan.disbursed_at,
-        created_at=loan.created_at,
-    )
+    result = {
+        "loan_id": str(loan.id),
+        "loan_ref": loan.loan_ref,
+        "borrower_id": str(loan.borrower_id),
+        "lender_pool_id": str(loan.lender_pool_id),
+        "principal": str(loan.principal),
+        "currency": loan.currency,
+        "interest_rate_bps": loan.interest_rate_bps,
+        "current_ltv": str(current_ltv) if current_ltv else None,
+        "status": loan.status,
+        "disbursed_at": (
+            loan.disbursed_at.isoformat()
+            if loan.disbursed_at else None
+        ),
+        "created_at": (
+            loan.created_at.isoformat()
+            if loan.created_at else None
+        ),
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
+        "settlement_ref": chain["settlement_ref"],
+    }
     if idem_key:
-        store_idempotency_result(
-            db, idem_key, 201, result.model_dump(mode="json"),
-        )
-    return result
+        store_idempotency_result(db, idem_key, 201, result)
+    return JSONResponse(status_code=201, content=result)
 
 
 @app.post("/loans/{loan_ref}/repay")
@@ -947,13 +1081,19 @@ def close_loan(
         raise HTTPException(
             status_code=404, detail="Loan not found",
         )
-    loan = _close_loan(db, loan)
+    loan, chain = _close_loan(db, loan)
     result = {
         "loan_ref": loan.loan_ref,
         "status": loan.status,
         "closed_at": (
             loan.closed_at.isoformat() if loan.closed_at else None
         ),
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
+        "settlement_ref": chain["settlement_ref"],
     }
     if idem_key:
         store_idempotency_result(db, idem_key, 200, result)
@@ -1046,6 +1186,145 @@ def get_interest_history(
         }
         for ev in events
     ]
+
+
+@app.get("/settlements")
+def list_settlements(
+    status_filter: Optional[str] = Query(
+        None, alias="status",
+    ),
+    db: Session = Depends(get_db_session),
+):
+    """List all on-chain settlements with tx hashes and block numbers."""
+    query = select(Settlement).order_by(
+        Settlement.created_at.desc(),
+    )
+    if status_filter:
+        query = query.where(Settlement.status == status_filter)
+    settlements = db.execute(query).scalars().all()
+    return [
+        {
+            "settlement_ref": s.settlement_ref,
+            "tx_hash": s.tx_hash,
+            "block_number": s.block_number,
+            "confirmations": s.confirmations,
+            "status": s.status,
+            "operation": s.operation,
+            "asset_type": s.asset_type,
+            "quantity": str(s.quantity),
+            "related_entity_type": s.related_entity_type,
+            "signed_at": (
+                s.signed_at.isoformat() if s.signed_at else None
+            ),
+            "broadcasted_at": (
+                s.broadcasted_at.isoformat()
+                if s.broadcasted_at else None
+            ),
+            "confirmed_at": (
+                s.confirmed_at.isoformat()
+                if s.confirmed_at else None
+            ),
+            "created_at": (
+                s.created_at.isoformat()
+                if s.created_at else None
+            ),
+        }
+        for s in settlements
+    ]
+
+
+@app.get("/settlements/tx/{tx_hash:path}")
+def get_settlement_by_tx(
+    tx_hash: str,
+    db: Session = Depends(get_db_session),
+):
+    """Look up a settlement by its on-chain transaction hash."""
+    settlement = db.execute(
+        select(Settlement).where(Settlement.tx_hash == tx_hash),
+    ).scalar_one_or_none()
+    if not settlement:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No settlement found for tx_hash {tx_hash}",
+        )
+    return {
+        "settlement_ref": settlement.settlement_ref,
+        "tx_hash": settlement.tx_hash,
+        "block_number": settlement.block_number,
+        "confirmations": settlement.confirmations,
+        "required_confirmations": settlement.required_confirmations,
+        "status": settlement.status,
+        "operation": settlement.operation,
+        "asset_type": settlement.asset_type,
+        "quantity": str(settlement.quantity),
+        "related_entity_type": settlement.related_entity_type,
+        "related_entity_id": str(settlement.related_entity_id),
+        "approved_by": settlement.approved_by,
+        "signed_at": (
+            settlement.signed_at.isoformat()
+            if settlement.signed_at else None
+        ),
+        "broadcasted_at": (
+            settlement.broadcasted_at.isoformat()
+            if settlement.broadcasted_at else None
+        ),
+        "confirmed_at": (
+            settlement.confirmed_at.isoformat()
+            if settlement.confirmed_at else None
+        ),
+        "created_at": (
+            settlement.created_at.isoformat()
+            if settlement.created_at else None
+        ),
+    }
+
+
+@app.get("/settlements/{ref}")
+def get_settlement(
+    ref: str,
+    db: Session = Depends(get_db_session),
+):
+    """Get settlement details by settlement reference."""
+    settlement = db.execute(
+        select(Settlement).where(
+            Settlement.settlement_ref == ref,
+        ),
+    ).scalar_one_or_none()
+    if not settlement:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Settlement {ref} not found",
+        )
+    return {
+        "settlement_ref": settlement.settlement_ref,
+        "tx_hash": settlement.tx_hash,
+        "block_number": settlement.block_number,
+        "confirmations": settlement.confirmations,
+        "required_confirmations": settlement.required_confirmations,
+        "status": settlement.status,
+        "operation": settlement.operation,
+        "asset_type": settlement.asset_type,
+        "quantity": str(settlement.quantity),
+        "related_entity_type": settlement.related_entity_type,
+        "related_entity_id": str(settlement.related_entity_id),
+        "approved_by": settlement.approved_by,
+        "signed_at": (
+            settlement.signed_at.isoformat()
+            if settlement.signed_at else None
+        ),
+        "broadcasted_at": (
+            settlement.broadcasted_at.isoformat()
+            if settlement.broadcasted_at else None
+        ),
+        "confirmed_at": (
+            settlement.confirmed_at.isoformat()
+            if settlement.confirmed_at else None
+        ),
+        "created_at": (
+            settlement.created_at.isoformat()
+            if settlement.created_at else None
+        ),
+    }
 
 
 if __name__ == "__main__":

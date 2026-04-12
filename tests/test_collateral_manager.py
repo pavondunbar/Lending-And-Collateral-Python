@@ -45,7 +45,7 @@ sys.modules.setdefault("events", _evt_mod)
 
 _cm_spec = importlib.util.spec_from_file_location(
     "collateral_manager_main",
-    "/Users/pavondunbar/Lending-And-Collateral"
+    "/Users/pavondunbar/LENDING"
     "/services/collateral-manager/main.py",
 )
 _cm_mod = importlib.util.module_from_spec(_cm_spec)
@@ -112,6 +112,9 @@ class TestDepositCollateral:
         assert body["asset_type"] == "BTC"
         assert body["status"] == "active"
         assert body["collateral_ref"].startswith("COL-")
+        assert body["tx_hash"].startswith("0x")
+        assert body["block_number"] > 19_000_000
+        assert body["settlement_ref"].startswith("STL-")
 
     def test_deposit_creates_outbox_event(self, client, db):
         pool, borrower, loan = _setup_loan_with_price(db)
@@ -153,7 +156,10 @@ class TestWithdrawCollateral:
             "quantity": "0.5",
         })
         assert resp.status_code == 200
-        assert resp.json()["status"] == "active"
+        body = resp.json()
+        assert body["status"] == "active"
+        assert body["tx_hash"].startswith("0x")
+        assert body["block_number"] > 19_000_000
 
     def test_withdrawal_rejected_when_ltv_exceeds_limit(
         self, client, db,

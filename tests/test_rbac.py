@@ -7,12 +7,8 @@ storage for admin, operator, signer, and viewer roles.
 
 import sys
 
-sys.path.insert(
-    0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON"
-)
-sys.path.insert(
-    0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON/shared"
-)
+sys.path.insert(0, "/Users/pavondunbar/LENDING")
+sys.path.insert(0, "/Users/pavondunbar/LENDING/shared")
 
 import pytest
 

@@ -9,12 +9,8 @@ requiring a running Kafka broker.
 import sys
 import uuid
 
-sys.path.insert(
-    0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON"
-)
-sys.path.insert(
-    0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON/shared"
-)
+sys.path.insert(0, "/Users/pavondunbar/LENDING")
+sys.path.insert(0, "/Users/pavondunbar/LENDING/shared")
 
 import pytest
 from sqlalchemy import select

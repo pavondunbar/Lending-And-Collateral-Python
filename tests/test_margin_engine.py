@@ -49,7 +49,7 @@ sys.modules.setdefault("events", _evt_mod)
 
 _me_spec = importlib.util.spec_from_file_location(
     "margin_engine_main",
-    "/Users/pavondunbar/Lending-And-Collateral"
+    "/Users/pavondunbar/LENDING"
     "/services/margin-engine/main.py",
 )
 _me_mod = importlib.util.module_from_spec(_me_spec)

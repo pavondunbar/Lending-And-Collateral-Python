@@ -551,6 +551,48 @@ async def prices_root_proxy(
     )
 
 
+# --- Settlement / Blockchain Routes ----------------------------------------
+
+
+@app.api_route(
+    "/v1/settlements/{path:path}",
+    methods=["GET"],
+    tags=["Settlements"],
+    dependencies=[Depends(require_api_key)],
+)
+async def settlements_proxy(
+    path: str,
+    request: Request,
+    client: httpx.AsyncClient = Depends(get_client),
+):
+    """
+    Proxy to the Lending Engine's settlement endpoints.
+    Endpoints: /settlements  /settlements/{ref}
+    /settlements/tx/{tx_hash}
+    """
+    return await _proxy(
+        request,
+        UPSTREAM["lending"],
+        f"/settlements/{path}",
+        client,
+    )
+
+
+@app.api_route(
+    "/v1/settlements",
+    methods=["GET"],
+    tags=["Settlements"],
+    dependencies=[Depends(require_api_key)],
+)
+async def settlements_root_proxy(
+    request: Request,
+    client: httpx.AsyncClient = Depends(get_client),
+):
+    return await _proxy(
+        request, UPSTREAM["lending"], "/settlements", client,
+    )
+
+
 # --- API Reference --------------------------------------------------------
 
 
@@ -602,6 +644,17 @@ def root():
                 "POST /v1/prices/feed": "Ingest price feed",
                 "GET  /v1/prices/{asset}": "Latest price",
                 "GET  /v1/prices": "All latest prices",
+            },
+            "settlements": {
+                "GET  /v1/settlements": (
+                    "List all on-chain settlements"
+                ),
+                "GET  /v1/settlements/{ref}": (
+                    "Get settlement by reference"
+                ),
+                "GET  /v1/settlements/tx/{tx_hash}": (
+                    "Look up settlement by tx hash"
+                ),
             },
         },
         "auth": "Pass X-API-Key header on all /v1/* requests",

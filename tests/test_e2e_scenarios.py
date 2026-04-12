@@ -58,7 +58,7 @@ sys.modules.setdefault("events", _evt_mod)
 # Load service business logic.
 _le_spec = importlib.util.spec_from_file_location(
     "lending_engine_main",
-    "/Users/pavondunbar/Lending-And-Collateral"
+    "/Users/pavondunbar/LENDING"
     "/services/lending-engine/main.py",
 )
 _le_mod = importlib.util.module_from_spec(_le_spec)
@@ -71,7 +71,7 @@ OriginateLoanRequest = _le_mod.OriginateLoanRequest
 
 _me_spec = importlib.util.spec_from_file_location(
     "margin_engine_main",
-    "/Users/pavondunbar/Lending-And-Collateral"
+    "/Users/pavondunbar/LENDING"
     "/services/margin-engine/main.py",
 )
 _me_mod = importlib.util.module_from_spec(_me_spec)
@@ -128,9 +128,11 @@ class TestHappyPath:
             interest_rate_bps=800,
             collateral_refs=[col.collateral_ref],
         )
-        loan = _originate_loan(db, req)
+        loan, chain = _originate_loan(db, req)
         assert loan.status == "active"
         assert loan.loan_ref.startswith("LOAN-")
+        assert chain["tx_hash"].startswith("0x")
+        assert chain["block_number"] > 19_000_000
 
         from datetime import date
         accrual = _accrue_interest(
@@ -142,11 +144,15 @@ class TestHappyPath:
             db, loan, Decimal("50200"), "USD",
         )
         assert result["fully_repaid"] is True
+        assert result["tx_hash"].startswith("0x")
+        assert result["block_number"] > 19_000_000
         assert loan.status == "repaid"
 
-        loan = _close_loan(db, loan)
+        loan, close_chain = _close_loan(db, loan)
         assert loan.status == "closed"
         assert loan.closed_at is not None
+        assert close_chain["tx_hash"].startswith("0x")
+        assert close_chain["block_number"] > 19_000_000
 
         originated = get_outbox_events(db, "loan.originated")
         assert len(originated) >= 1
@@ -187,7 +193,7 @@ class TestMarginCallScenario:
             interest_rate_bps=800,
             collateral_refs=[col.collateral_ref],
         )
-        loan = _originate_loan(db, req)
+        loan, _chain = _originate_loan(db, req)
         assert loan.status == "active"
 
         make_price_feed(db, "BTC", Decimal("38000"))
@@ -252,7 +258,7 @@ class TestLiquidationScenario:
             interest_rate_bps=800,
             collateral_refs=[col.collateral_ref],
         )
-        loan = _originate_loan(db, req)
+        loan, _chain = _originate_loan(db, req)
 
         make_price_feed(db, "BTC", Decimal("20000"))
         result = _evaluate_loan_ltv(db, loan)

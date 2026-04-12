@@ -34,7 +34,7 @@ sys.modules.setdefault("events", _evt_mod)
 
 _po_spec = importlib.util.spec_from_file_location(
     "price_oracle_main",
-    "/Users/pavondunbar/Lending-And-Collateral"
+    "/Users/pavondunbar/LENDING"
     "/services/price-oracle/main.py",
 )
 _po_mod = importlib.util.module_from_spec(_po_spec)

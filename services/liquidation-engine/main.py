@@ -25,7 +25,6 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_EVEN
 from typing import Optional
 
-import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -54,9 +53,12 @@ from shared.idempotency import (
     get_idempotency_key, check_idempotency,
     store_idempotency_result,
 )
+from shared.blockchain import mine_transaction
+from shared.settlement import create_settlement, transition_settlement
+from shared.request_context import get_actor_id, get_trace_id
 from events import (
     LiquidationInitiated, LiquidationExecuted,
-    LiquidationCompleted,
+    LiquidationCompleted, SettlementConfirmed,
 )
 
 # ────────────────────────────────────────────────────────────────────
@@ -71,10 +73,6 @@ SERVICE = os.environ.get("SERVICE_NAME", "liquidation-engine")
 PRECISION = Decimal("0.000000000000000001")
 ZERO = Decimal("0")
 
-SIGNING_GATEWAY_URL = os.environ.get(
-    "SIGNING_GATEWAY_URL", "http://signing-gateway:8006",
-)
-
 SYSTEM_CUSTODY_ACCOUNT_ID = os.environ.get(
     "SYSTEM_CUSTODY_ACCOUNT_ID",
     "00000000-0000-0000-0000-000000000002",
@@ -85,6 +83,76 @@ SYSTEM_CUSTODY_ACCOUNT_ID = os.environ.get(
 
 def normalize(amount: Decimal) -> Decimal:
     return amount.quantize(PRECISION, rounding=ROUND_HALF_EVEN)
+
+
+def _settle_on_chain(
+    db: Session,
+    operation: str,
+    entity_type: str,
+    entity_id,
+    asset_type: str,
+    quantity: Decimal,
+    *receipt_seeds: str,
+) -> dict:
+    """Create a settlement with full blockchain lifecycle."""
+    receipt = mine_transaction(operation, *receipt_seeds)
+    actor = get_actor_id() or SERVICE
+    trace = get_trace_id()
+
+    settlement = create_settlement(
+        db,
+        related_entity_type=entity_type,
+        related_entity_id=entity_id,
+        operation=operation,
+        asset_type=asset_type,
+        quantity=quantity,
+        actor_id=actor,
+        trace_id=trace,
+    )
+
+    transition_settlement(
+        db, settlement, "approved",
+        actor_id=actor, trace_id=trace,
+        approved_by=actor,
+    )
+    transition_settlement(
+        db, settlement, "signed",
+        actor_id=actor, trace_id=trace,
+        tx_hash=receipt.tx_hash,
+    )
+    transition_settlement(
+        db, settlement, "broadcasted",
+        actor_id=actor, trace_id=trace,
+        tx_hash=receipt.tx_hash,
+        block_number=receipt.block_number,
+    )
+    transition_settlement(
+        db, settlement, "confirmed",
+        actor_id=actor, trace_id=trace,
+        confirmations=receipt.confirmations,
+    )
+
+    insert_outbox_event(
+        db,
+        settlement.settlement_ref,
+        "settlement.confirmed",
+        SettlementConfirmed(
+            service=SERVICE,
+            settlement_ref=settlement.settlement_ref,
+            tx_hash=receipt.tx_hash,
+            block_number=receipt.block_number,
+            confirmations=receipt.confirmations,
+        ),
+    )
+
+    return {
+        "tx_hash": receipt.tx_hash,
+        "block_number": receipt.block_number,
+        "block_hash": receipt.block_hash,
+        "gas_used": receipt.gas_used,
+        "confirmations": receipt.confirmations,
+        "settlement_ref": settlement.settlement_ref,
+    }
 
 
 def _get_latest_prices(db: Session) -> dict[str, Decimal]:
@@ -133,37 +201,6 @@ def _get_coa_balance(
         )
     ).scalar()
     return result if result is not None else ZERO
-
-
-def _sign_collateral_release(
-    loan_ref: str,
-    asset_type: str,
-    quantity: Decimal,
-) -> Optional[str]:
-    """Call signing-gateway to sign a collateral release tx."""
-    try:
-        resp = httpx.post(
-            f"{SIGNING_GATEWAY_URL}/sign",
-            json={
-                "operation": "collateral_release",
-                "loan_ref": loan_ref,
-                "asset_type": asset_type,
-                "quantity": str(quantity),
-            },
-            timeout=10.0,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("tx_hash")
-        log.warning(
-            "Signing gateway returned %d: %s",
-            resp.status_code, resp.text,
-        )
-    except httpx.RequestError as exc:
-        log.warning(
-            "Signing gateway unreachable: %s", exc,
-        )
-    return None
 
 
 # ─── API Schemas ───────────────────────────────────────────────────
@@ -395,10 +432,6 @@ def _execute_collateral_sale(
             remaining_to_sell = ZERO
     db.flush()
 
-    tx_hash = _sign_collateral_release(
-        loan.loan_ref, asset_type, quantity,
-    )
-
     custody_account = (
         str(position.custodian_id)
         if position.custodian_id
@@ -439,6 +472,18 @@ def _execute_collateral_sale(
         liq_event.id, "executing",
     )
 
+    chain = _settle_on_chain(
+        db,
+        "liquidation_sale",
+        "liquidation",
+        liq_event.id,
+        asset_type,
+        quantity,
+        liquidation_ref,
+        str(quantity),
+        str(sale_price),
+    )
+
     insert_outbox_event(
         db, loan.loan_ref, "liquidation.executed",
         LiquidationExecuted(
@@ -451,28 +496,15 @@ def _execute_collateral_sale(
                 "quantity_sold": str(quantity),
                 "sale_price": str(sale_price),
                 "gross_proceeds": str(gross_proceeds),
-                "tx_hash": tx_hash,
+                "tx_hash": chain["tx_hash"],
             },
         ),
     )
 
-    from shared.settlement import create_settlement
-    from shared.request_context import get_actor_id, get_trace_id
-    settlement = create_settlement(
-        db,
-        related_entity_type="liquidation",
-        related_entity_id=liq_event.id,
-        operation="collateral_sale",
-        asset_type=asset_type,
-        quantity=quantity,
-        actor_id=get_actor_id(),
-        trace_id=get_trace_id(),
-    )
-
     log.info(
-        "Collateral sold: %s %s %s @ %s = %s",
+        "Collateral sold: %s %s %s @ %s tx=%s block=%d",
         liquidation_ref, quantity, asset_type,
-        sale_price, gross_proceeds,
+        sale_price, chain["tx_hash"], chain["block_number"],
     )
 
     return {
@@ -482,9 +514,13 @@ def _execute_collateral_sale(
         "sale_price": str(sale_price),
         "gross_proceeds": str(gross_proceeds),
         "total_proceeds": str(liq_event.total_proceeds),
-        "tx_hash": tx_hash,
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
         "status": liq_event.status,
-        "settlement_ref": settlement.settlement_ref,
+        "settlement_ref": chain["settlement_ref"],
     }
 
 
@@ -659,11 +695,21 @@ def _apply_waterfall(
         ),
     )
 
+    chain = _settle_on_chain(
+        db,
+        "liquidation_waterfall",
+        "liquidation",
+        liq_event.id,
+        loan.currency,
+        total_proceeds,
+        liquidation_ref,
+        str(total_proceeds),
+    )
+
     log.info(
-        "Waterfall applied: %s interest=%s principal=%s"
-        " fees=%s remainder=%s",
-        liquidation_ref, interest_portion, principal_portion,
-        fee_portion, borrower_remainder,
+        "Waterfall applied: %s tx=%s block=%d",
+        liquidation_ref,
+        chain["tx_hash"], chain["block_number"],
     )
 
     return {
@@ -676,6 +722,12 @@ def _apply_waterfall(
         "borrower_remainder": str(borrower_remainder),
         "loan_status": loan.status,
         "liquidation_status": liq_event.status,
+        "tx_hash": chain["tx_hash"],
+        "block_number": chain["block_number"],
+        "block_hash": chain["block_hash"],
+        "gas_used": chain["gas_used"],
+        "confirmations": chain["confirmations"],
+        "settlement_ref": chain["settlement_ref"],
     }
 
 

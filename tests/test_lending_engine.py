@@ -47,7 +47,7 @@ sys.modules.setdefault("events", _evt_mod)
 # Import the FastAPI app via importlib (directory has hyphens).
 _le_spec = importlib.util.spec_from_file_location(
     "lending_engine_main",
-    "/Users/pavondunbar/Lending-And-Collateral"
+    "/Users/pavondunbar/LENDING"
     "/services/lending-engine/main.py",
 )
 _le_mod = importlib.util.module_from_spec(_le_spec)
@@ -117,6 +117,9 @@ class TestOriginateLoan:
         body = resp.json()
         assert body["status"] == "active"
         assert body["loan_ref"].startswith("LOAN-")
+        assert body["tx_hash"].startswith("0x")
+        assert body["block_number"] > 19_000_000
+        assert body["settlement_ref"].startswith("STL-")
 
     def test_origination_creates_journal_entries(
         self, client, db,
@@ -290,6 +293,8 @@ class TestRepayLoan:
         body = resp.json()
         assert body["fully_repaid"] is False
         assert body["status"] == "active"
+        assert body["tx_hash"].startswith("0x")
+        assert body["block_number"] > 19_000_000
 
     def test_full_repayment(self, client, db):
         pool, borrower, col = _setup_borrower_with_collateral(db)
@@ -334,7 +339,10 @@ class TestCloseLoan:
         )
         resp = client.post(f"/loans/{loan_ref}/close")
         assert resp.status_code == 200
-        assert resp.json()["status"] == "closed"
+        body = resp.json()
+        assert body["status"] == "closed"
+        assert body["tx_hash"].startswith("0x")
+        assert body["block_number"] > 19_000_000
 
     def test_close_active_loan_rejected(self, client, db):
         pool, borrower, col = _setup_borrower_with_collateral(db)

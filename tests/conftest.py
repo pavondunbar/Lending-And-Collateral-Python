@@ -27,8 +27,8 @@ compiles(UUID, "sqlite")(
 )
 
 # ── path setup ────────────────────────────────────────────────────────────────
-sys.path.insert(0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON")
-sys.path.insert(0, "/Users/pavondunbar/STABLECOIN-PYTHON/LENDING-PYTHON/shared")
+sys.path.insert(0, "/Users/pavondunbar/LENDING")
+sys.path.insert(0, "/Users/pavondunbar/LENDING/shared")
 
 # Patch env before any service module is imported
 import os
