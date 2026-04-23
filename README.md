@@ -1,4 +1,6 @@
-# Institutional Lending & Collateral Management Platform (Python)
+# Institutional Lending & Collateral Management Platform
+
+<img width="1620" height="971" alt="9bdfb2f4-04e5-472b-9dfe-e5792d84a012" src="https://github.com/user-attachments/assets/11f6b83e-3b38-44ff-b993-b79bb97616e4" />
 
 > :warning: **SANDBOX / EDUCATIONAL USE ONLY — NOT FOR PRODUCTION**
 > This codebase is a reference implementation designed for learning, prototyping, and architectural exploration. It is **not audited, not legally reviewed, and must not be used to originate real loans, manage real collateral, or handle real investor funds.** See the [Production Warning](#-production-warning) section for full details.
